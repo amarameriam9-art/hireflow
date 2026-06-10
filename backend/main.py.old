@@ -1,0 +1,136 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import uuid
+import asyncio
+from io import BytesIO
+
+from agents.parser import CVParseur
+from agents.matcher import MatcherAgent
+from agents.interviewer import InterviewerAgent
+from agents.synthesizer import SynthesizerAgent
+
+app = FastAPI(title="HireFlow API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:5174"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialisation des agents
+parser = CVParseur(api_key=None)  # Mettez votre clé OpenAI ici
+matcher = MatcherAgent()
+interviewer = InterviewerAgent(api_key=None)
+synthesizer = SynthesizerAgent()
+
+# Stockage temporaire (à remplacer par DB plus tard)
+candidates_store = {}
+
+class JobDescription(BaseModel):
+    title: str
+    description: str
+    required_skills: List[str]
+    experience_years: int
+
+@app.get("/")
+def root():
+    return {"message": "HireFlow API is running!", "agents": ["parser", "matcher", "interviewer", "synthesizer"]}
+
+@app.post("/api/process-cv")
+async def process_cv(
+    file: UploadFile = File(...),
+    job_title: str = "",
+    job_skills: str = "",
+    job_exp: int = 0
+):
+    """Traite un CV individuel avec tous les agents"""
+    
+    # Job data
+    job_data = {
+        "title": job_title,
+        "required_skills": [s.strip() for s in job_skills.split(",")] if job_skills else [],
+        "experience_years": job_exp
+    }
+    
+    # Lire le fichier
+    content = await file.read()
+    
+    # 1. Agent Parseur
+    cv_data = await parser.parse(content, file.filename)
+    if "error" in cv_data:
+        return JSONResponse(status_code=400, content={"error": cv_data["error"]})
+    
+    # 2. Agent Matcher
+    match_result = await matcher.match(cv_data, job_data)
+    
+    # 3. Agent Interviewer (génère questions basées sur gaps)
+    gaps = f"Expérience: {match_result.get('experience_score', 0)}/100, Compétences faibles: {[s['skill'] for s in match_result.get('skills_match', []) if s['score'] < 50]}"
+    questions = await interviewer.generate_questions(cv_data, job_data, gaps)
+    
+    # 4. Agent Synthétiseur
+    candidate_id = str(uuid.uuid4())[:8]
+    candidate_name = cv_data.get('nom', 'Candidat')
+    report = await synthesizer.synthesize(candidate_id, candidate_name, cv_data, match_result, questions)
+    
+    # Stocker
+    candidates_store[candidate_id] = {
+        "id": candidate_id,
+        "name": candidate_name,
+        "email": cv_data.get('email', ''),
+        "cv_data": cv_data,
+        "match_result": match_result,
+        "questions": questions,
+        "report": report,
+        "filename": file.filename
+    }
+    
+    return {
+        "candidate_id": candidate_id,
+        "name": candidate_name,
+        "score": report["score"],
+        "recommendation": report["recommendation"],
+        "strengths": report["strengths"],
+        "risks": report["risks"],
+        "questions": questions[:3]
+    }
+
+@app.get("/api/candidates")
+async def list_candidates():
+    """Liste tous les candidats traités"""
+    return list(candidates_store.values())
+
+@app.get("/api/candidates/{candidate_id}")
+async def get_candidate(candidate_id: str):
+    """Détails d'un candidat"""
+    if candidate_id not in candidates_store:
+        raise HTTPException(status_code=404, detail="Candidat non trouvé")
+    return candidates_store[candidate_id]
+
+@app.post("/api/chat/{candidate_id}")
+async def chat_with_candidate(candidate_id: str, question: str):
+    """Chat simple sur le dossier candidat (RAG simplifié)"""
+    if candidate_id not in candidates_store:
+        raise HTTPException(status_code=404, detail="Candidat non trouvé")
+    
+    candidate = candidates_store[candidate_id]
+    cv_data = candidate.get('cv_data', {})
+    
+    # Réponse simple basée sur les données
+    answer = f"Basé sur le CV: "
+    if "manag" in question.lower():
+        experiences = cv_data.get('experiences', [])
+        has_managed = any('lead' in exp.get('poste', '').lower() or 'manager' in exp.get('poste', '').lower() for exp in experiences)
+        if has_managed:
+            answer += "Oui, le candidat a occupé des postes d'encadrement."
+        else:
+            answer += "Le CV ne mentionne pas d'expérience en management."
+    else:
+        competences = cv_data.get('competences', [])
+        answer += f"Compétences du candidat: {', '.join(competences[:5])}"
+    
+    return {"answer": answer}

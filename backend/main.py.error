@@ -1,0 +1,203 @@
+﻿# Dans PowerShell, allez dans le dossier backend
+cd C:\Users\benam_n0danil\hireflow\backend
+
+# Faites une sauvegarde
+Copy-Item main.py main.py.error
+
+# Créez le nouveau fichier corrigé
+@'
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from typing import List
+import uuid
+import os
+
+# ========== CRÉATION DE L'APPLICATION (DOIT ÊTRE EN PREMIER) ==========
+app = FastAPI(title="HireFlow API")
+
+# ========== CORS (DOIT VENIR APRÈS app) ==========
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========== STOCKAGE TEMPORAIRE ==========
+candidates_db = {}
+
+# ========== IMPORT DES AGENTS (APRÈS app) ==========
+from agents.parser_simple import SimpleParser
+parser = SimpleParser()
+
+# ========== ENDPOINTS ==========
+
+@app.get("/")
+def root():
+    return {
+        "message": "HireFlow API is running!",
+        "status": "ok",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.post("/api/upload")
+async def upload_cv(file: UploadFile = File(...)):
+    """Upload simple d'un CV"""
+    content = await file.read()
+    candidate_id = str(uuid.uuid4())[:8]
+    
+    candidates_db[candidate_id] = {
+        "id": candidate_id,
+        "filename": file.filename,
+        "size": len(content),
+        "status": "pending",
+        "score": None,
+        "skills": [],
+        "name": None
+    }
+    
+    return {
+        "candidate_id": candidate_id,
+        "filename": file.filename,
+        "message": "Fichier uploadé avec succès"
+    }
+
+@app.post("/api/upload-batch")
+async def upload_batch(files: List[UploadFile] = File(...)):
+    """Upload multiple CVs en batch"""
+    results = []
+    
+    for file in files:
+        content = await file.read()
+        candidate_id = str(uuid.uuid4())[:8]
+        
+        candidates_db[candidate_id] = {
+            "id": candidate_id,
+            "filename": file.filename,
+            "size": len(content),
+            "status": "pending",
+            "score": None,
+            "skills": [],
+            "name": None,
+            "content": content  # Stockage temporaire (attention mémoire)
+        }
+        
+        results.append({
+            "candidate_id": candidate_id,
+            "filename": file.filename,
+            "status": "queued"
+        })
+    
+    return {
+        "total": len(files),
+        "queued": len(files),
+        "candidates": results
+    }
+
+@app.post("/api/process/{candidate_id}")
+async def process_candidate(candidate_id: str):
+    """Traite un candidat avec le parseur"""
+    if candidate_id not in candidates_db:
+        return JSONResponse(status_code=404, content={"error": "Candidat non trouvé"})
+    
+    candidate = candidates_db[candidate_id]
+    
+    try:
+        # Utiliser le parseur sur le contenu du fichier
+        file_content = candidate.get("content", b"")
+        filename = candidate.get("filename", "")
+        
+        parsed_data = parser.parse(file_content, filename)
+        
+        skills = parsed_data.get("competences", [])
+        name = parsed_data.get("nom", filename.split(".")[0])
+        
+        # Calcul du score basé sur le nombre de compétences trouvées
+        score = min(95, 30 + len(skills) * 10)
+        
+        candidates_db[candidate_id].update({
+            "status": "completed",
+            "score": score,
+            "skills": skills,
+            "name": name
+        })
+        
+        # Nettoyer le contenu binaire pour économiser la mémoire
+        candidates_db[candidate_id]["content"] = None
+        
+        return {
+            "candidate_id": candidate_id,
+            "score": score,
+            "skills": skills,
+            "name": name,
+            "status": "completed"
+        }
+    except Exception as e:
+        candidates_db[candidate_id]["status"] = "error"
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/api/process-all")
+async def process_all_candidates():
+    """Traite tous les candidats en attente"""
+    pending_ids = [cid for cid, c in candidates_db.items() if c.get("status") == "pending"]
+    results = []
+    
+    for cid in pending_ids:
+        result = await process_candidate(cid)
+        results.append(result)
+    
+    return {
+        "processed": len(pending_ids),
+        "results": results
+    }
+
+@app.get("/api/candidates")
+def list_candidates():
+    """Liste tous les candidats"""
+    # Nettoyer les données pour l'affichage
+    clean_list = []
+    for cid, c in candidates_db.items():
+        clean_list.append({
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "filename": c.get("filename"),
+            "score": c.get("score"),
+            "skills": c.get("skills", []),
+            "status": c.get("status")
+        })
+    return clean_list
+
+@app.get("/api/candidates/{candidate_id}")
+def get_candidate(candidate_id: str):
+    """Détails d'un candidat"""
+    if candidate_id not in candidates_db:
+        return JSONResponse(status_code=404, content={"error": "Candidat non trouvé"})
+    candidate = candidates_db[candidate_id].copy()
+    candidate.pop("content", None)  # Enlever le contenu binaire de la réponse
+    return candidate
+
+@app.delete("/api/candidates/{candidate_id}")
+def delete_candidate(candidate_id: str):
+    """Supprimer un candidat"""
+    if candidate_id in candidates_db:
+        del candidates_db[candidate_id]
+        return {"message": "Candidat supprimé"}
+    return JSONResponse(status_code=404, content={"error": "Candidat non trouvé"})
+
+@app.delete("/api/candidates")
+def delete_all_candidates():
+    """Supprimer tous les candidats"""
+    count = len(candidates_db)
+    candidates_db.clear()
+    return {"message": f"{count} candidats supprimés"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+'@ | Out-File -FilePath main.py -Encoding UTF8
